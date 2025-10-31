@@ -14,10 +14,14 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 if not DISCORD_TOKEN:
     raise SystemExit("Missing DISCORD_TOKEN environment variable.")
 
+# Optional proxy (e.g., Cloudflare Worker) to bypass WAF on Replit
+PROXY_BASE = os.environ.get("PROXY_BASE")  # e.g., https://your-worker.workers.dev/api
+
 GUILD_IDS = [1429395255786082315, 1433848533580124303]
 GUILDS = [discord.Object(id=i) for i in GUILD_IDS]
 
-KALSHI_BASES = [
+# Try proxy first (if provided), then official APIs
+KALSHI_BASES = ([PROXY_BASE] if PROXY_BASE else []) + [
     "https://api.kalshi.com/trade-api/v2",
     "https://api.elections.kalshi.com/trade-api/v2",
 ]
@@ -98,6 +102,7 @@ async def kalshi_get(path, params=None):
                 r = await s.get(f"{base}{path}", params=params)
                 ctype = r.headers.get("Content-Type", "")
                 if "application/json" not in ctype:
+                    # Non-JSON (likely HTML challenge) → try next base
                     raise RuntimeError(f"Non-JSON from {base}: {r.status_code} {ctype}")
                 r.raise_for_status()
                 return r.json()
@@ -128,6 +133,7 @@ async def fetch_markets_open(limit=200):
             if not cursor or len(results) >= 1200:
                 break
 
+    # try progressively looser status filters
     for status in ("open", "active", None):
         await pull(status)
         if results:
@@ -213,6 +219,51 @@ async def movers_cmd(interaction: discord.Interaction):
     out = [f"**{title}**\n`{ticker}` • YES≈${(yes if yes is not None else 0):.2f if yes is not None else '—'} • vol={vol}"
            for _, title, ticker, yes, vol in top]
     for chunk in chunk_lines(out):
+        await interaction.followup.send(chunk)
+
+# --- Diagnostics for Replit / WAF ---
+@app_commands.guilds(*GUILDS)
+@tree.command(name="diag", description="Show Kalshi API diagnostics")
+async def diag_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    report = []
+    try:
+        for status in ("open", "active", None):
+            try:
+                params = {"limit": 25}
+                if status:
+                    params["status"] = status
+                data = await kalshi_get("/markets", params)
+                mkts = data.get("markets", []) or []
+                sample = [m.get("title", "")[:70] for m in mkts[:3]]
+                report.append(f"{status or 'no status'}: {len(mkts)} • ex: {sample}")
+            except Exception as e:
+                report.append(f"{status or 'no status'}: ERROR {e!r}")
+        await interaction.followup.send(" | ".join(report))
+    except Exception as e:
+        await interaction.followup.send(f"API error: {e!r}")
+
+@app_commands.guilds(*GUILDS)
+@tree.command(name="probe", description="Inspect raw /markets response")
+async def probe_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    reports = []
+    for base in KALSHI_BASES:
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(20.0),
+                headers=HEADERS,
+                follow_redirects=True,
+                http2=False,
+            ) as s:
+                r = await s.get(f"{base}/markets", params={"limit": 5})
+                ctype = r.headers.get("Content-Type", "")
+                snip = r.text[:400].replace("\n", " ")
+                reports.append(f"{base} → {r.status_code} • {ctype} • {len(r.text)} bytes • {snip}")
+        except Exception as e:
+            reports.append(f"{base} → ERROR {e!r}")
+    # send in chunks to avoid 2000-char limit
+    for chunk in chunk_lines(reports, max_chars=1800, sep="\n\n"):
         await interaction.followup.send(chunk)
 
 # -------------- Alerts --------------
