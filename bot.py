@@ -1,5 +1,5 @@
 # bot.py
-import os, json, asyncio
+import os, json, asyncio, re
 from pathlib import Path
 import discord
 from discord import app_commands
@@ -266,6 +266,153 @@ async def probe_cmd(interaction: discord.Interaction):
     for chunk in chunk_lines(reports, max_chars=1800, sep="\n\n"):
         await interaction.followup.send(chunk)
 
+# -------------- Watch / Unwatch / List --------------
+@app_commands.guilds(*GUILDS)
+@tree.command(name="watch", description="Watch a market; optional YES threshold to alert")
+@app_commands.describe(
+    ticker="Kalshi market ticker (e.g., KX...)",
+    threshold="Alert when YES ≤ threshold (0.00–1.00, e.g., 0.35)"
+)
+async def watch_cmd(interaction: discord.Interaction, ticker: str, threshold: float | None = None):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    gid = str(interaction.guild_id)
+    if not gid or gid == "None":
+        await interaction.followup.send("Run this in a **server** (not DMs) so I can send channel alerts.")
+        return
+
+    w = watches.get(gid, {})
+    w[ticker.upper()] = {"threshold": threshold}
+    watches[gid] = w
+    save_watches(watches)
+
+    msg = f"Watching `{ticker.upper()}`"
+    if threshold is not None:
+        msg += f" (alert when YES ≤ ${threshold:.2f})"
+    await interaction.followup.send(msg)
+
+@app_commands.guilds(*GUILDS)
+@tree.command(name="unwatch", description="Remove a watched market")
+@app_commands.describe(ticker="Kalshi market ticker (e.g., KX...)")
+async def unwatch_cmd(interaction: discord.Interaction, ticker: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    gid = str(interaction.guild_id)
+    if not gid or gid == "None":
+        await interaction.followup.send("Run this in a **server** (not DMs) so I can find that guild’s watchlist.")
+        return
+
+    w = watches.get(gid, {})
+    removed = w.pop(ticker.upper(), None)
+    watches[gid] = w
+    save_watches(watches)
+
+    if removed:
+        await interaction.followup.send(f"Removed `{ticker.upper()}` from watchlist.")
+    else:
+        await interaction.followup.send(f"`{ticker.upper()}` wasn’t being watched.")
+
+@app_commands.guilds(*GUILDS)
+@tree.command(name="list", description="List watched markets for this server")
+async def list_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    gid = str(interaction.guild_id)
+    if not gid or gid == "None":
+        await interaction.followup.send("Run this in a **server** (not DMs).")
+        return
+
+    w = watches.get(gid, {})
+    if not w:
+        await interaction.followup.send("No watches set.")
+        return
+
+    lines = []
+    for t, cfg in w.items():
+        thr = cfg.get("threshold")
+        thr_text = f" (YES ≤ ${thr:.2f})" if isinstance(thr, (int, float)) else ""
+        lines.append(f"`{t}`{thr_text}")
+
+    # split to stay under 2k char limit
+    for chunk in chunk_lines(lines, max_chars=1800, sep="\n"):
+        await interaction.followup.send(chunk)
+
+# -------------- Free-form helpers & commands --------------
+def parse_first_ticker(s: str) -> str | None:
+    """
+    Find something that looks like a Kalshi ticker, e.g. KXNFL...-...-...
+    """
+    for tok in re.findall(r'[A-Z0-9][A-Z0-9_.-]{6,}', (s or "").upper()):
+        if tok.startswith('KX') and '-' in tok:
+            return tok
+    return None
+
+def parse_threshold(s: str) -> float | None:
+    m = re.search(r'(?:threshold\s*[:=]?\s*)?([01](?:\.\d+)?|\.\d+)', s, flags=re.I)
+    if not m:
+        return None
+    try:
+        val = float(m.group(1))
+        # Accept .35 or 0.35 (and ignore >1.0)
+        if 0 < val <= 1.0:
+            return val
+        return None
+    except Exception:
+        return None
+
+@app_commands.guilds(*GUILDS)
+@tree.command(name="watch_raw", description="Free-form watch: paste ticker and optional threshold")
+@app_commands.describe(text='Examples: "ticker: KX... threshold: 0.35" | "KX... 0.35" | "0.4 KX..."')
+async def watch_raw_cmd(interaction: discord.Interaction, text: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    gid = str(interaction.guild_id)
+    if not gid or gid == "None":
+        await interaction.followup.send("Run this in a **server** (not DMs) so I can send channel alerts.")
+        return
+
+    ticker = parse_first_ticker(text)
+    if not ticker:
+        await interaction.followup.send("Couldn’t find a valid ticker in your text. Paste something like `KX...-...`")
+        return
+
+    thr = parse_threshold(text)
+    w = watches.get(gid, {})
+    w[ticker.upper()] = {"threshold": thr}
+    watches[gid] = w
+    save_watches(watches)
+
+    if thr is not None:
+        await interaction.followup.send(f"Watching `{ticker.upper()}` (alert when YES ≤ ${thr:.2f}).")
+    else:
+        await interaction.followup.send(f"Watching `{ticker.upper()}` (no threshold set). Use `/watch` to add one later.")
+
+@app_commands.guilds(*GUILDS)
+@tree.command(name="unwatch_raw", description="Free-form unwatch: paste text that contains a ticker")
+@app_commands.describe(text='Example: "unwatch KXNFL...-BUFJCOOK4-90"')
+async def unwatch_raw_cmd(interaction: discord.Interaction, text: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    gid = str(interaction.guild_id)
+    if not gid or gid == "None":
+        await interaction.followup.send("Run this in a **server** (not DMs) so I can find that guild’s watchlist.")
+        return
+
+    ticker = parse_first_ticker(text)
+    if not ticker:
+        await interaction.followup.send("Couldn’t find a valid ticker in your text. Paste something like `KX...-...`")
+        return
+
+    w = watches.get(gid, {})
+    removed = w.pop(ticker.upper(), None)
+    watches[gid] = w
+    save_watches(watches)
+
+    if removed:
+        await interaction.followup.send(f"Removed `{ticker.upper()}` from watchlist.")
+    else:
+        await interaction.followup.send(f"`{ticker.upper()}` wasn’t being watched.")
+
 # -------------- Alerts --------------
 async def alert_loop():
     await client.wait_until_ready()
@@ -289,6 +436,25 @@ async def alert_loop():
         except Exception as e:
             print("alert_loop error:", e)
             await asyncio.sleep(5)
+
+# -------------- Global error handler --------------
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: Exception):
+    from discord.app_commands import CommandInvokeError
+
+    msg = "Something went wrong."
+    if isinstance(error, CommandInvokeError) and getattr(error, "original", None):
+        msg = f"Command error: {type(error.original).__name__}: {error.original}"
+    else:
+        msg = f"{type(error).__name__}: {error}"
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(f"⚠️ {msg}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"⚠️ {msg}", ephemeral=True)
+    except Exception:
+        pass
 
 # -------------- Startup --------------
 @client.event
