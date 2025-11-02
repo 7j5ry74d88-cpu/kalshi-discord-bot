@@ -262,7 +262,6 @@ async def probe_cmd(interaction: discord.Interaction):
                 reports.append(f"{base} → {r.status_code} • {ctype} • {len(r.text)} bytes • {snip}")
         except Exception as e:
             reports.append(f"{base} → ERROR {e!r}")
-    # send in chunks to avoid 2000-char limit
     for chunk in chunk_lines(reports, max_chars=1800, sep="\n\n"):
         await interaction.followup.send(chunk)
 
@@ -274,6 +273,8 @@ async def probe_cmd(interaction: discord.Interaction):
     threshold="Alert when YES ≤ threshold (0.00–1.00, e.g., 0.35)"
 )
 async def watch_cmd(interaction: discord.Interaction, ticker: str, threshold: float | None = None):
+    # First-line log to confirm handler invocation
+    print(f"[watch] invoked by user={interaction.user.id} in guild={interaction.guild_id} ticker={ticker} thr={threshold}")
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     gid = str(interaction.guild_id)
@@ -290,6 +291,39 @@ async def watch_cmd(interaction: discord.Interaction, ticker: str, threshold: fl
     if threshold is not None:
         msg += f" (alert when YES ≤ ${threshold:.2f})"
     await interaction.followup.send(msg)
+
+# Fallback duplicate to bypass any cached-stale command shapes
+@app_commands.guilds(*GUILDS)
+@tree.command(name="watch2", description="Watch a market (fallback) with optional YES threshold")
+@app_commands.describe(
+    ticker="Kalshi market ticker (e.g., KX...)",
+    threshold="Alert when YES ≤ threshold (0.00–1.00, e.g., 0.35)"
+)
+async def watch2_cmd(interaction: discord.Interaction, ticker: str, threshold: float | None = None):
+    print(f"[watch2] invoked by user={interaction.user.id} in guild={interaction.guild_id} ticker={ticker} thr={threshold}")
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        gid = str(interaction.guild_id)
+        if not gid or gid == "None":
+            await interaction.followup.send("Run this in a **server** (not DMs) so I can send channel alerts.")
+            return
+
+        w = watches.get(gid, {})
+        w[ticker.upper()] = {"threshold": threshold}
+        watches[gid] = w
+        save_watches(watches)
+
+        msg = f"Watching `{ticker.upper()}`"
+        if isinstance(threshold, (int, float)):
+            msg += f" (alert when YES ≤ ${threshold:.2f})"
+        await interaction.followup.send(msg, ephemeral=True)
+        print(f"[watch2] ok guild={gid} ticker={ticker.upper()} thr={threshold}")
+    except Exception as e:
+        print("[watch2] error:", repr(e))
+        try:
+            await interaction.followup.send(f"⚠️ Error: {e}", ephemeral=True)
+        except Exception:
+            pass
 
 @app_commands.guilds(*GUILDS)
 @tree.command(name="unwatch", description="Remove a watched market")
@@ -333,15 +367,11 @@ async def list_cmd(interaction: discord.Interaction):
         thr_text = f" (YES ≤ ${thr:.2f})" if isinstance(thr, (int, float)) else ""
         lines.append(f"`{t}`{thr_text}")
 
-    # split to stay under 2k char limit
     for chunk in chunk_lines(lines, max_chars=1800, sep="\n"):
         await interaction.followup.send(chunk)
 
 # -------------- Free-form helpers & commands --------------
 def parse_first_ticker(s: str) -> str | None:
-    """
-    Find something that looks like a Kalshi ticker, e.g. KXNFL...-...-...
-    """
     for tok in re.findall(r'[A-Z0-9][A-Z0-9_.-]{6,}', (s or "").upper()):
         if tok.startswith('KX') and '-' in tok:
             return tok
@@ -353,7 +383,6 @@ def parse_threshold(s: str) -> float | None:
         return None
     try:
         val = float(m.group(1))
-        # Accept .35 or 0.35 (and ignore >1.0)
         if 0 < val <= 1.0:
             return val
         return None
@@ -441,13 +470,11 @@ async def alert_loop():
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: Exception):
     from discord.app_commands import CommandInvokeError
-
     msg = "Something went wrong."
     if isinstance(error, CommandInvokeError) and getattr(error, "original", None):
         msg = f"Command error: {type(error.original).__name__}: {error.original}"
     else:
         msg = f"{type(error).__name__}: {error}"
-
     try:
         if interaction.response.is_done():
             await interaction.followup.send(f"⚠️ {msg}", ephemeral=True)
@@ -460,11 +487,18 @@ async def on_app_command_error(interaction: discord.Interaction, error: Exceptio
 @client.event
 async def on_ready():
     try:
+        # HARD RESYNC: clear then re-add guild commands to avoid stale cached shapes
         for gid in GUILD_IDS:
             await tree.sync(guild=discord.Object(id=gid))
+            tree.clear_commands(guild=discord.Object(id=gid))
+        await asyncio.sleep(0.5)
+        for gid in GUILD_IDS:
+            await tree.sync(guild=discord.Object(id=gid))
+
         for gid in GUILD_IDS:
             cmds = await tree.fetch_commands(guild=discord.Object(id=gid))
             print(f"Guild {gid} commands → {len(cmds)}: {[c.name for c in cmds]}")
+
         print(f"🤖 {client.user} is online and ready!")
     except Exception as e:
         print("Slash sync failed:", e)
