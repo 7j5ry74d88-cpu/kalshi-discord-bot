@@ -4,6 +4,8 @@ from pathlib import Path
 import discord
 from discord import app_commands
 import httpx
+from aiohttp import web  # health server
+from urllib.parse import urlparse, parse_qs
 
 # -------------- Basic Config --------------
 DATA_DIR = Path("data")
@@ -75,6 +77,15 @@ client = MyClient(intents=intents)
 tree = client.tree
 
 # -------------- Helpers --------------
+def fmt_price(val):
+    """Return a human string for a YES price, or '—' if missing."""
+    if val is None:
+        return "—"
+    try:
+        return f"{float(val):.2f}"
+    except Exception:
+        return "—"
+
 def chunk_lines(lines, max_chars=1800, sep="\n\n"):
     chunk, length = [], 0
     for line in lines:
@@ -87,6 +98,43 @@ def chunk_lines(lines, max_chars=1800, sep="\n\n"):
             length += len(add)
     if chunk:
         yield sep.join(chunk)
+
+# --- Link & Ticker parsing for /vol ---
+def extract_kalshi_query(link_or_ticker: str):
+    """
+    Return a dict like:
+      {"ticker": "..."}  OR
+      {"event_ticker": "..."} OR {"series_ticker": "..."}
+    If nothing found, return {}.
+    """
+    s = (link_or_ticker or "").strip()
+
+    # If they pasted a raw ticker
+    if re.match(r"^KX[A-Z0-9_.-]+-[A-Z0-9_.-]+", s):
+        return {"ticker": s.upper()}
+
+    # If it's a URL, look for parts/params
+    try:
+        u = urlparse(s)
+        qs = parse_qs(u.query)
+        # API-style links may have event_ticker or series_ticker
+        if "event_ticker" in qs and qs["event_ticker"]:
+            return {"event_ticker": qs["event_ticker"][0].upper()}
+        if "series_ticker" in qs and qs["series_ticker"]:
+            return {"series_ticker": qs["series_ticker"][0].upper()}
+
+        # Web UI market page like: /markets/<TICKER>
+        parts = [p for p in u.path.split("/") if p]
+        if "markets" in parts:
+            ix = parts.index("markets")
+            if ix + 1 < len(parts):
+                t = parts[ix + 1]
+                if t.upper().startswith("KX"):
+                    return {"ticker": t.upper()}
+    except Exception:
+        pass
+
+    return {}
 
 # -------------- Kalshi API --------------
 async def kalshi_get(path, params=None):
@@ -171,10 +219,44 @@ async def market_snapshot(ticker):
             return None, None
 
 # -------------- Slash Commands --------------
+
+# /help (clean, user-facing)
 @app_commands.guilds(*GUILDS)
-@tree.command(name="ping", description="Health check")
-async def ping_cmd(interaction: discord.Interaction):
-    await interaction.response.send_message("Pong! ✅", ephemeral=True)
+@tree.command(name="help", description="Show all commands and how to use the Kalshi bot.")
+async def help_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="📘 Liquidity Seers Kalshi Bot — Help",
+        description="Your assistant for tracking & analyzing Kalshi markets.",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(
+        name="🎯 Core",
+        value=(
+            "**/find <keyword>** — Search open markets by name.\n"
+            "**/movers** — Top active markets (by volume & range).\n"
+            "**/vol <link-or-ticker>** — Show volume for a market, event, or series link (or raw ticker)."
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🔔 Watch & Alerts",
+        value=(
+            "**/watch <ticker> [threshold]** — Watch a market; optional alert when YES ≤ threshold.\n"
+            "**/list** — Show this server’s watchlist.\n"
+            "**/unwatch <ticker>** — Remove from watchlist."
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="💡 Notes",
+        value=(
+            "• Bot checks watched markets every 60s.\n"
+            "• Alerts post in the first text channel of the server.\n"
+            "• Use `/find` to quickly get valid tickers."
+        ),
+        inline=False
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @app_commands.guilds(*GUILDS)
 @tree.command(name="find", description="Find Kalshi markets by keyword")
@@ -194,8 +276,11 @@ async def find_cmd(interaction: discord.Interaction, query: str):
     if not hits:
         await interaction.followup.send(f"No open markets matched `{query}`.")
         return
-    out = [f"**{t}**\n`{tick}` • YES≈${y:.2f}" if y else f"**{t}**\n`{tick}`"
-           for t, tick, y in hits]
+    out = []
+    for t, tick, y in hits:
+        price = fmt_price(y)
+        price_str = f"${price}" if price != "—" else "—"
+        out.append(f"**{t}**\n`{tick}` • YES≈{price_str}")
     for chunk in chunk_lines(out):
         await interaction.followup.send(chunk)
 
@@ -216,54 +301,66 @@ async def movers_cmd(interaction: discord.Interaction):
     if not top:
         await interaction.followup.send("No open markets found.")
         return
-    out = [f"**{title}**\n`{ticker}` • YES≈${(yes if yes is not None else 0):.2f if yes is not None else '—'} • vol={vol}"
-           for _, title, ticker, yes, vol in top]
+    out = []
+    for _, title, ticker, yes, vol in top:
+        price = fmt_price(yes)
+        price_str = f"${price}" if price != "—" else "—"
+        out.append(f"**{title}**\n`{ticker}` • YES≈{price_str} • vol={vol}")
     for chunk in chunk_lines(out):
         await interaction.followup.send(chunk)
 
-# --- Diagnostics for Replit / WAF ---
+# NEW: /vol — show volume from link or ticker
 @app_commands.guilds(*GUILDS)
-@tree.command(name="diag", description="Show Kalshi API diagnostics")
-async def diag_cmd(interaction: discord.Interaction):
+@tree.command(name="vol", description="Show volume for a Kalshi market/event/series link or raw ticker.")
+@app_commands.describe(link_or_ticker="Paste a Kalshi link (market/event/series) or a raw ticker (e.g., KX...).")
+async def vol_cmd(interaction: discord.Interaction, link_or_ticker: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    report = []
-    try:
-        for status in ("open", "active", None):
-            try:
-                params = {"limit": 25}
-                if status:
-                    params["status"] = status
-                data = await kalshi_get("/markets", params)
-                mkts = data.get("markets", []) or []
-                sample = [m.get("title", "")[:70] for m in mkts[:3]]
-                report.append(f"{status or 'no status'}: {len(mkts)} • ex: {sample}")
-            except Exception as e:
-                report.append(f"{status or 'no status'}: ERROR {e!r}")
-        await interaction.followup.send(" | ".join(report))
-    except Exception as e:
-        await interaction.followup.send(f"API error: {e!r}")
+    q = extract_kalshi_query(link_or_ticker)
+    if not q:
+        await interaction.followup.send("I couldn’t detect a ticker/event/series in that. Paste a Kalshi link or a `KX...` ticker.")
+        return
 
-@app_commands.guilds(*GUILDS)
-@tree.command(name="probe", description="Inspect raw /markets response")
-async def probe_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    reports = []
-    for base in KALSHI_BASES:
+    # Single market volume
+    if "ticker" in q:
         try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(20.0),
-                headers=HEADERS,
-                follow_redirects=True,
-                http2=False,
-            ) as s:
-                r = await s.get(f"{base}/markets", params={"limit": 5})
-                ctype = r.headers.get("Content-Type", "")
-                snip = r.text[:400].replace("\n", " ")
-                reports.append(f"{base} → {r.status_code} • {ctype} • {len(r.text)} bytes • {snip}")
+            data = await fetch_market(q["ticker"])
+            m = data.get("market", {}) or {}
+            vol = m.get("volume", 0) or 0
+            title = m.get("title", q["ticker"])
+            await interaction.followup.send(f"**{title}**\n`{q['ticker']}` • **Volume:** ${vol:,}")
         except Exception as e:
-            reports.append(f"{base} → ERROR {e!r}")
-    for chunk in chunk_lines(reports, max_chars=1800, sep="\n\n"):
-        await interaction.followup.send(chunk)
+            await interaction.followup.send(f"Couldn’t fetch `{q['ticker']}`: {e}")
+        return
+
+    # Aggregate for event_ticker or series_ticker
+    params = {"limit": 200}
+    if "event_ticker" in q:
+        params["event_ticker"] = q["event_ticker"]
+        label = f"Event `{q['event_ticker']}`"
+    else:
+        params["series_ticker"] = q["series_ticker"]
+        label = f"Series `{q['series_ticker']}`"
+
+    try:
+        data = await kalshi_get("/markets", params)
+        mkts = data.get("markets", []) or []
+        total = sum((m.get("volume", 0) or 0) for m in mkts)
+        count = len(mkts)
+        if count == 0:
+            await interaction.followup.send(f"{label}: no markets found.")
+            return
+        lines = [f"{label} • Markets: {count} • **Total Volume:** ${total:,}"]
+        # Show top few by volume
+        top = sorted(mkts, key=lambda m: (m.get("volume", 0) or 0), reverse=True)[:5]
+        for m in top:
+            t = m.get("ticker", "")
+            ttl = (m.get("title", "") or "")[:90]
+            v = m.get("volume", 0) or 0
+            lines.append(f"• `{t}` — ${v:,} — {ttl}")
+        for chunk in chunk_lines(lines, max_chars=1800, sep="\n"):
+            await interaction.followup.send(chunk)
+    except Exception as e:
+        await interaction.followup.send(f"Error fetching volume: {e}")
 
 # -------------- Watch / Unwatch / List --------------
 @app_commands.guilds(*GUILDS)
@@ -273,7 +370,6 @@ async def probe_cmd(interaction: discord.Interaction):
     threshold="Alert when YES ≤ threshold (0.00–1.00, e.g., 0.35)"
 )
 async def watch_cmd(interaction: discord.Interaction, ticker: str, threshold: float | None = None):
-    # First-line log to confirm handler invocation
     print(f"[watch] invoked by user={interaction.user.id} in guild={interaction.guild_id} ticker={ticker} thr={threshold}")
     await interaction.response.defer(ephemeral=True, thinking=True)
 
@@ -333,7 +429,7 @@ async def unwatch_cmd(interaction: discord.Interaction, ticker: str):
 
     gid = str(interaction.guild_id)
     if not gid or gid == "None":
-        await interaction.followup.send("Run this in a **server** (not DMs) so I can find that guild’s watchlist.")
+        await interaction.followup.send("Run this in a **server** (not DMs) so I can find that guild's watchlist.")
         return
 
     w = watches.get(gid, {})
@@ -344,7 +440,7 @@ async def unwatch_cmd(interaction: discord.Interaction, ticker: str):
     if removed:
         await interaction.followup.send(f"Removed `{ticker.upper()}` from watchlist.")
     else:
-        await interaction.followup.send(f"`{ticker.upper()}` wasn’t being watched.")
+        await interaction.followup.send(f"`{ticker.upper()}` wasn't being watched.")
 
 @app_commands.guilds(*GUILDS)
 @tree.command(name="list", description="List watched markets for this server")
@@ -369,78 +465,6 @@ async def list_cmd(interaction: discord.Interaction):
 
     for chunk in chunk_lines(lines, max_chars=1800, sep="\n"):
         await interaction.followup.send(chunk)
-
-# -------------- Free-form helpers & commands --------------
-def parse_first_ticker(s: str) -> str | None:
-    for tok in re.findall(r'[A-Z0-9][A-Z0-9_.-]{6,}', (s or "").upper()):
-        if tok.startswith('KX') and '-' in tok:
-            return tok
-    return None
-
-def parse_threshold(s: str) -> float | None:
-    m = re.search(r'(?:threshold\s*[:=]?\s*)?([01](?:\.\d+)?|\.\d+)', s, flags=re.I)
-    if not m:
-        return None
-    try:
-        val = float(m.group(1))
-        if 0 < val <= 1.0:
-            return val
-        return None
-    except Exception:
-        return None
-
-@app_commands.guilds(*GUILDS)
-@tree.command(name="watch_raw", description="Free-form watch: paste ticker and optional threshold")
-@app_commands.describe(text='Examples: "ticker: KX... threshold: 0.35" | "KX... 0.35" | "0.4 KX..."')
-async def watch_raw_cmd(interaction: discord.Interaction, text: str):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    gid = str(interaction.guild_id)
-    if not gid or gid == "None":
-        await interaction.followup.send("Run this in a **server** (not DMs) so I can send channel alerts.")
-        return
-
-    ticker = parse_first_ticker(text)
-    if not ticker:
-        await interaction.followup.send("Couldn’t find a valid ticker in your text. Paste something like `KX...-...`")
-        return
-
-    thr = parse_threshold(text)
-    w = watches.get(gid, {})
-    w[ticker.upper()] = {"threshold": thr}
-    watches[gid] = w
-    save_watches(watches)
-
-    if thr is not None:
-        await interaction.followup.send(f"Watching `{ticker.upper()}` (alert when YES ≤ ${thr:.2f}).")
-    else:
-        await interaction.followup.send(f"Watching `{ticker.upper()}` (no threshold set). Use `/watch` to add one later.")
-
-@app_commands.guilds(*GUILDS)
-@tree.command(name="unwatch_raw", description="Free-form unwatch: paste text that contains a ticker")
-@app_commands.describe(text='Example: "unwatch KXNFL...-BUFJCOOK4-90"')
-async def unwatch_raw_cmd(interaction: discord.Interaction, text: str):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    gid = str(interaction.guild_id)
-    if not gid or gid == "None":
-        await interaction.followup.send("Run this in a **server** (not DMs) so I can find that guild’s watchlist.")
-        return
-
-    ticker = parse_first_ticker(text)
-    if not ticker:
-        await interaction.followup.send("Couldn’t find a valid ticker in your text. Paste something like `KX...-...`")
-        return
-
-    w = watches.get(gid, {})
-    removed = w.pop(ticker.upper(), None)
-    watches[gid] = w
-    save_watches(watches)
-
-    if removed:
-        await interaction.followup.send(f"Removed `{ticker.upper()}` from watchlist.")
-    else:
-        await interaction.followup.send(f"`{ticker.upper()}` wasn’t being watched.")
 
 # -------------- Alerts --------------
 async def alert_loop():
@@ -503,8 +527,35 @@ async def on_ready():
     except Exception as e:
         print("Slash sync failed:", e)
 
+# -------------- Health server (optional) --------------
+async def start_health_server():
+    """
+    Tiny web server for hosts that require a listening port (Replit Web/Render Web).
+    Only runs if PORT env var is set.
+    """
+    port = os.environ.get("PORT")
+    if not port:
+        return
+
+    async def handle(_request):
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", handle)
+    app.router.add_get("/healthz", handle)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=int(port))
+    await site.start()
+    print(f"🩺 Health server listening on :{port}")
+
 # -------------- Run --------------
 async def main():
+    # Start optional health server first (only if PORT is set)
+    await start_health_server()
+
+    # Then run the Discord client
     async with client:
         await client.start(DISCORD_TOKEN)
 
