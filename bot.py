@@ -92,11 +92,17 @@ tree = client.tree
 
 # -------------- Helpers --------------
 def to_cents_str(val: float | None) -> str:
-    """Format a 0–1 price as cents like '65¢', or '—' if missing."""
+    """Format a 0–1 price as cents like '65¢', with proper handling for low values."""
     if val is None:
         return "—"
     try:
-        return f"{round(float(val)*100):.0f}¢"
+        cents = float(val) * 100
+        if cents == 0:
+            return "0¢"
+        elif cents < 1:
+            return f"{cents:.2f}¢"  # Show decimals for very low prices
+        else:
+            return f"{round(cents):.0f}¢"
     except Exception:
         return "—"
 
@@ -188,54 +194,53 @@ async def fetch_market(ticker):
 async def fetch_orderbook(ticker):
     return await kalshi_get(f"/markets/{ticker}/orderbook")
 
-# Improved snapshot with fallbacks and last trade
+# IMPROVED: Market snapshot with actual current prices
 async def market_snapshot(ticker: str):
     """
-    Returns (yes_price, no_bid, last_yes) in 0–1 floats with smart fallbacks:
-      - yes_price: best YES we can infer (YES bid, or 1-NO bid, or last trade)
-      - no_bid: best NO bid if present, else inferred (1-YES), else None
-      - last_yes: last traded YES (if available), else None
+    Returns (yes_price, no_price, last_price, volume) with proper current prices
     """
-    yes_bid = None
-    no_bid  = None
-    last_yes = None
-
-    try:
-        ob = await fetch_orderbook(ticker)
-        yside = ob.get("yes", []) or []
-        nside = ob.get("no", []) or []
-        if yside:
-            yes_bid = max(level.get("price", 0) for level in yside) / 100.0
-        if nside:
-            no_bid  = max(level.get("price", 0) for level in nside) / 100.0
-    except Exception:
-        pass
-
-    try:
-        m = await fetch_market(ticker)
-        lp = (m.get("market", {}) or {}).get("last_price")
-        if isinstance(lp, int):
-            last_yes = lp / 100.0
-    except Exception:
-        pass
-
-    # YES fallback chain
     yes_price = None
-    if yes_bid is not None:
-        yes_price = yes_bid
-    elif no_bid is not None:
-        yes_price = round(1 - no_bid, 2)
-    elif last_yes is not None:
-        yes_price = last_yes
+    no_price = None
+    last_price = None
+    volume = 0
 
-    # NO fallback chain
-    if no_bid is None:
-        if yes_bid is not None:
-            no_bid = round(1 - yes_bid, 2)
-        elif last_yes is not None:
-            no_bid = round(1 - last_yes, 2)
+    try:
+        # Get the actual market data which contains the current price
+        market_data = await fetch_market(ticker)
+        market_info = market_data.get("market", {})
+        
+        # The current YES price is in 'yes_ask' (to buy YES) or 'last_price'
+        yes_ask = market_info.get("yes_ask")
+        yes_bid = market_info.get("yes_bid") 
+        last_price = market_info.get("last_price")
+        volume = market_info.get("volume", 0)
+        
+        # Priority: yes_ask (current price to buy YES) -> yes_bid -> last_price
+        if yes_ask is not None:
+            yes_price = yes_ask / 100.0
+        elif yes_bid is not None:
+            yes_price = yes_bid / 100.0
+        elif last_price is not None:
+            yes_price = last_price / 100.0
+            
+        # NO price is simply 1 - YES price
+        if yes_price is not None:
+            no_price = round(1 - yes_price, 4)
+            
+    except Exception as e:
+        print(f"Error fetching market data for {ticker}: {e}")
+        # Fallback to orderbook if market endpoint fails
+        try:
+            ob = await fetch_orderbook(ticker)
+            yside = ob.get("yes", []) or []
+            if yside:
+                best_ask = min(level.get("price", 100) for level in yside)  # Lowest ask price
+                yes_price = best_ask / 100.0
+                no_price = 1 - yes_price
+        except Exception as ob_error:
+            print(f"Orderbook fallback also failed: {ob_error}")
 
-    return yes_price, no_bid, last_yes
+    return yes_price, no_price, last_price, volume
 
 def market_volume_from_payload(market_payload: dict) -> int:
     try:
@@ -258,7 +263,8 @@ async def help_cmd(interaction: discord.Interaction):
         "• **/watch <TICKER> [threshold]** — Watch a market; optional alert when YES ≤ threshold (e.g., `0.35`).\n"
         "• **/unwatch <TICKER>** — Stop watching a market.\n"
         "• **/list** — List all watched markets for this server.\n"
-        "• **/vol <link-or-ticker> [minutes]** — Show current YES (cents), volume, and change vs ~N minutes ago.\n\n"
+        "• **/vol <link-or-ticker> [minutes]** — Show current YES (cents), volume, and change vs ~N minutes ago.\n"
+        "• **/price <link-or-ticker>** — Quick price check for a market.\n\n"
         "_Tips:_ You can paste a Kalshi link anywhere a ticker is accepted. Prices show like `65¢` (i.e., $0.65)."
     )
     await interaction.response.send_message(txt, ephemeral=True)
@@ -283,8 +289,8 @@ async def find_cmd(interaction: discord.Interaction, query: str):
         title = (m.get("title", "") or "").lower()
         if any(n in title for n in needles):
             ticker = m.get("ticker")
-            yes, _, _ = await market_snapshot(ticker)
-            hits.append((m.get("title",""), ticker, yes, int(m.get("volume",0) or 0)))
+            yes, _, _, vol = await market_snapshot(ticker)
+            hits.append((m.get("title",""), ticker, yes, vol))
             if len(hits) >= 12:
                 break
 
@@ -307,17 +313,17 @@ async def movers_cmd(interaction: discord.Interaction):
     for m in mkts:
         ticker, title = m.get("ticker"), m.get("title", "")
         vol = int(m.get("volume", 0) or 0)
-        yes, no_bid, _ = await market_snapshot(ticker)
-        rng = abs(yes - (1 - no_bid)) if (yes is not None and no_bid is not None) else 0
+        yes, no_price, _, _ = await market_snapshot(ticker)
+        rng = abs(yes - (1 - no_price)) if (yes is not None and no_price is not None) else 0
         score = vol + rng * 100
-        scored.append((score, title, ticker, yes, no_bid, vol))
+        scored.append((score, title, ticker, yes, no_price, vol))
     top = sorted(scored, key=lambda x: x[0], reverse=True)[:20]
     if not top:
         await interaction.followup.send("No open markets found.")
         return
     out = []
-    for _, title, ticker, yes, no_bid, vol in top:
-        out.append(f"**{title}**\n`{ticker}` • YES≈{to_cents_str(yes)} • NO(bid)≈{to_cents_str(no_bid)} • vol={vol}")
+    for _, title, ticker, yes, no_price, vol in top:
+        out.append(f"**{title}**\n`{ticker}` • YES≈{to_cents_str(yes)} • NO≈{to_cents_str(no_price)} • vol={vol}")
     for chunk in chunk_lines(out):
         await interaction.followup.send(chunk)
 
@@ -354,7 +360,7 @@ async def unwatch_cmd(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
     gid = str(interaction.guild_id)
     if not gid or gid == "None":
-        await interaction.followup.send("Run this in a **server** (not DMs) so I can find that guild’s watchlist.")
+        await interaction.followup.send("Run this in a **server** (not DMs) so I can find that guild's watchlist.")
         return
 
     tick = extract_ticker(ticker) or ticker.upper().strip()
@@ -366,7 +372,7 @@ async def unwatch_cmd(interaction: discord.Interaction, ticker: str):
     if removed:
         await interaction.followup.send(f"Removed `{tick}` from watchlist.")
     else:
-        await interaction.followup.send(f"`{tick}` wasn’t being watched.")
+        await interaction.followup.send(f"`{tick}` wasn't being watched.")
 
 @maybe_guilds_decorator()
 @tree.command(name="list", description="List watched markets for this server")
@@ -374,7 +380,7 @@ async def list_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
     gid = str(interaction.guild_id)
     if not gid or gid == "None":
-        await interaction.followup.send("Run this in a **server** (not DMs)." )
+        await interaction.followup.send("Run this in a **server** (not DMs).")
         return
 
     w = watches.get(gid, {})
@@ -390,47 +396,75 @@ async def list_cmd(interaction: discord.Interaction):
     for chunk in chunk_lines(lines, max_chars=1800, sep="\n"):
         await interaction.followup.send(chunk)
 
+# NEW: Simple price command
 @maybe_guilds_decorator()
-@tree.command(name="vol", description="Show current YES (cents), volume, and Δ vs N minutes ago")
+@tree.command(name="price", description="Quick price check for a market")
+@app_commands.describe(link_or_ticker="Kalshi link or ticker")
+async def price_cmd(interaction: discord.Interaction, link_or_ticker: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    
+    ticker = extract_ticker(link_or_ticker) or link_or_ticker.upper().strip()
+    yes_price, no_price, last_price, volume = await market_snapshot(ticker)
+    
+    # Record for history
+    record_price(ticker, yes_price)
+    
+    response = [
+        f"**{ticker}**",
+        f"💰 YES: {to_cents_str(yes_price)}",
+        f"📊 NO: {to_cents_str(no_price)}",
+        f"📈 Volume: {volume}",
+    ]
+    
+    if last_price and last_price / 100.0 != yes_price:
+        response.append(f"🕒 Last: {to_cents_str(last_price / 100.0)}")
+    
+    await interaction.followup.send(" • ".join(response))
+
+# UPDATED: Volume command with better price display
+@maybe_guilds_decorator()
+@tree.command(name="vol", description="Show current price, volume, and price change")
 @app_commands.describe(
-    link_or_ticker="Paste a Kalshi link or the market ticker",
+    link_or_ticker="Kalshi link or ticker",
     minutes="Look-back window in minutes (default 15)"
 )
 async def vol_cmd(interaction: discord.Interaction, link_or_ticker: str, minutes: int = 15):
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     ticker = extract_ticker(link_or_ticker) or link_or_ticker.upper().strip()
-    # Current snapshot
-    yes_now, no_now, _ = await market_snapshot(ticker)
-
-    # Volume read
-    vol = 0
-    try:
-        mp = await fetch_market(ticker)
-        vol = market_volume_from_payload(mp)
-    except Exception:
-        pass
-
-    # Record current into history (so next queries have data)
+    
+    # Get current price
+    yes_now, no_now, last_price, volume = await market_snapshot(ticker)
+    
+    # Record current price
     record_price(ticker, yes_now)
-
-    # Find prior yes at or before cutoff
-    cutoff = int(time.time()) - minutes*60
+    
+    # Find previous price
+    cutoff = int(time.time()) - minutes * 60
     arr = histories.get(ticker, [])
     yes_prev = None
-    # Walk from newest to oldest to find the first <= cutoff
     for ts, y in reversed(arr):
         if ts <= cutoff:
             yes_prev = y
             break
 
-    lines = [f"**{ticker}** • volume={vol} • YES≈{to_cents_str(yes_now)} • NO(bid)≈{to_cents_str(no_now)}"]
-    if yes_prev is None or yes_now is None:
-        lines.append(f"Δ — (no captured quotes ≥ {minutes}m; try again later)")
+    # Build response
+    lines = [
+        f"**{ticker}**",
+        f"• YES: {to_cents_str(yes_now)}",
+        f"• NO: {to_cents_str(no_now)}", 
+        f"• Volume: {volume}",
+    ]
+    
+    # Price change calculation
+    if yes_prev is not None and yes_now is not None:
+        delta_c = (yes_now - yes_prev) * 100
+        arrow = "↗️" if delta_c > 0 else "↘️" if delta_c < 0 else "➡️"
+        lines.append(f"• Δ {arrow} {delta_c:+.2f}¢ over {minutes}m")
+        lines.append(f"  ({to_cents_str(yes_prev)} → {to_cents_str(yes_now)})")
     else:
-        delta_c = round((yes_now - yes_prev)*100)
-        lines.append(f"Δ {delta_c:+.0f}¢ over {minutes}m (from {to_cents_str(yes_prev)} → {to_cents_str(yes_now)})")
-
+        lines.append(f"• Δ — (no prior data {minutes}m ago)")
+    
     await interaction.followup.send("\n".join(lines))
 
 # -------------- Alerts --------------
@@ -445,7 +479,7 @@ async def alert_loop():
                 chan = guild.text_channels[0]
                 for ticker, cfg in list(w.items()):
                     thr = cfg.get("threshold")
-                    yes, _, _ = await market_snapshot(ticker)
+                    yes, _, _, _ = await market_snapshot(ticker)
                     # log rolling history for /vol
                     record_price(ticker, yes)
                     if thr is None:
