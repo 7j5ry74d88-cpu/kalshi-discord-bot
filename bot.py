@@ -162,12 +162,10 @@ async def kalshi_get(path, params=None):
 async def fetch_markets_open(limit=200):
     seen, results = set(), []
 
-    async def pull(status):
+    async def pull(status="open"):
         cursor = None
         while True:
-            params = {"limit": limit}
-            if status:
-                params["status"] = status
+            params = {"limit": limit, "status": status}
             if cursor:
                 params["cursor"] = cursor
             data = await kalshi_get("/markets", params)
@@ -181,33 +179,50 @@ async def fetch_markets_open(limit=200):
             if not cursor or len(results) >= 1200:
                 break
 
-    for status in ("open", "active", None):
-        await pull(status)
-        if results:
-            break
+    # Only fetch OPEN markets, skip closed/expired ones
+    await pull("open")
+    
+    # If we need more results, also include "active" markets
+    if len(results) < 50:
+        await pull("active")
 
     return results
 
 async def fetch_market(ticker):
-    return await kalshi_get(f"/markets/{ticker}")
+    try:
+        data = await kalshi_get(f"/markets/{ticker}")
+        return data
+    except Exception as e:
+        # Check if it's a 404 error
+        if "404" in str(e) or "Not Found" in str(e):
+            raise Exception(f"Market not found - may be expired or invalid: {ticker}")
+        else:
+            raise e
 
 async def fetch_orderbook(ticker):
     return await kalshi_get(f"/markets/{ticker}/orderbook")
 
-# IMPROVED: Market snapshot with actual current prices
+# IMPROVED: Market snapshot with actual current prices and status checking
 async def market_snapshot(ticker: str):
     """
-    Returns (yes_price, no_price, last_price, volume) with proper current prices
+    Returns (yes_price, no_price, last_price, volume, status) with proper current prices
     """
     yes_price = None
     no_price = None
     last_price = None
     volume = 0
+    status = "unknown"
 
     try:
         # Get the actual market data which contains the current price
         market_data = await fetch_market(ticker)
         market_info = market_data.get("market", {})
+        
+        status = market_info.get("status", "unknown")
+        
+        # If market is closed, return None prices
+        if status in ["closed", "expired", "settled"]:
+            return None, None, None, volume, status
         
         # The current YES price is in 'yes_ask' (to buy YES) or 'last_price'
         yes_ask = market_info.get("yes_ask")
@@ -240,7 +255,7 @@ async def market_snapshot(ticker: str):
         except Exception as ob_error:
             print(f"Orderbook fallback also failed: {ob_error}")
 
-    return yes_price, no_price, last_price, volume
+    return yes_price, no_price, last_price, volume, status
 
 def market_volume_from_payload(market_payload: dict) -> int:
     try:
@@ -263,9 +278,11 @@ async def help_cmd(interaction: discord.Interaction):
         "• **/watch <TICKER> [threshold]** — Watch a market; optional alert when YES ≤ threshold (e.g., `0.35`).\n"
         "• **/unwatch <TICKER>** — Stop watching a market.\n"
         "• **/list** — List all watched markets for this server.\n"
-        "• **/vol <link-or-ticker> [minutes]** — Show current YES (cents), volume, and change vs ~N minutes ago.\n"
-        "• **/price <link-or-ticker>** — Quick price check for a market.\n\n"
-        "_Tips:_ You can paste a Kalshi link anywhere a ticker is accepted. Prices show like `65¢` (i.e., $0.65)."
+        "• **/vol <link-or-ticker> [minutes] [limit]** — Show prices, volume, and changes for one market or multiple related markets.\n\n"
+        "_Tips:_\n"
+        "- Use `/vol KXTICKER` for a single market with price history\n"
+        "- Use `/vol nfl` to see all NFL markets with prices and volumes\n"
+        "- Prices show like `65¢` (i.e., $0.65)"
     )
     await interaction.response.send_message(txt, ephemeral=True)
 
@@ -289,13 +306,15 @@ async def find_cmd(interaction: discord.Interaction, query: str):
         title = (m.get("title", "") or "").lower()
         if any(n in title for n in needles):
             ticker = m.get("ticker")
-            yes, _, _, vol = await market_snapshot(ticker)
-            hits.append((m.get("title",""), ticker, yes, vol))
+            yes, _, _, vol, status = await market_snapshot(ticker)
+            # Only include markets that are actually trading
+            if yes is not None:  # This filters out closed markets
+                hits.append((m.get("title",""), ticker, yes, vol))
             if len(hits) >= 12:
                 break
 
     if not hits:
-        await interaction.followup.send(f"No open markets matched `{query}`.")
+        await interaction.followup.send(f"No **open** markets matched `{query}`.")
         return
 
     out = []
@@ -313,13 +332,16 @@ async def movers_cmd(interaction: discord.Interaction):
     for m in mkts:
         ticker, title = m.get("ticker"), m.get("title", "")
         vol = int(m.get("volume", 0) or 0)
-        yes, no_price, _, _ = await market_snapshot(ticker)
+        yes, no_price, _, _, status = await market_snapshot(ticker)
+        # Skip closed markets
+        if yes is None:
+            continue
         rng = abs(yes - (1 - no_price)) if (yes is not None and no_price is not None) else 0
         score = vol + rng * 100
         scored.append((score, title, ticker, yes, no_price, vol))
     top = sorted(scored, key=lambda x: x[0], reverse=True)[:20]
     if not top:
-        await interaction.followup.send("No open markets found.")
+        await interaction.followup.send("No **open** markets found.")
         return
     out = []
     for _, title, ticker, yes, no_price, vol in top:
@@ -396,76 +418,111 @@ async def list_cmd(interaction: discord.Interaction):
     for chunk in chunk_lines(lines, max_chars=1800, sep="\n"):
         await interaction.followup.send(chunk)
 
-# NEW: Simple price command
+# ENHANCED: Volume command that can show multiple related markets
 @maybe_guilds_decorator()
-@tree.command(name="price", description="Quick price check for a market")
-@app_commands.describe(link_or_ticker="Kalshi link or ticker")
-async def price_cmd(interaction: discord.Interaction, link_or_ticker: str):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    
-    ticker = extract_ticker(link_or_ticker) or link_or_ticker.upper().strip()
-    yes_price, no_price, last_price, volume = await market_snapshot(ticker)
-    
-    # Record for history
-    record_price(ticker, yes_price)
-    
-    response = [
-        f"**{ticker}**",
-        f"💰 YES: {to_cents_str(yes_price)}",
-        f"📊 NO: {to_cents_str(no_price)}",
-        f"📈 Volume: {volume}",
-    ]
-    
-    if last_price and last_price / 100.0 != yes_price:
-        response.append(f"🕒 Last: {to_cents_str(last_price / 100.0)}")
-    
-    await interaction.followup.send(" • ".join(response))
-
-# UPDATED: Volume command with better price display
-@maybe_guilds_decorator()
-@tree.command(name="vol", description="Show current price, volume, and price change")
+@tree.command(name="vol", description="Show prices and volume for markets (single ticker or search term)")
 @app_commands.describe(
-    link_or_ticker="Kalshi link or ticker",
-    minutes="Look-back window in minutes (default 15)"
+    link_or_ticker="Kalshi link, ticker, OR search term (e.g., 'nfl', 'election')",
+    minutes="Look-back window in minutes for price changes (default 15)",
+    limit="Maximum number of markets to show (default 10)"
 )
-async def vol_cmd(interaction: discord.Interaction, link_or_ticker: str, minutes: int = 15):
+async def vol_cmd(interaction: discord.Interaction, link_or_ticker: str, minutes: int = 15, limit: int = 10):
     await interaction.response.defer(ephemeral=True, thinking=True)
 
-    ticker = extract_ticker(link_or_ticker) or link_or_ticker.upper().strip()
+    input_text = link_or_ticker.strip()
     
-    # Get current price
-    yes_now, no_now, last_price, volume = await market_snapshot(ticker)
+    # Check if it's a specific ticker
+    ticker = extract_ticker(input_text) or input_text.upper()
     
-    # Record current price
-    record_price(ticker, yes_now)
-    
-    # Find previous price
-    cutoff = int(time.time()) - minutes * 60
-    arr = histories.get(ticker, [])
-    yes_prev = None
-    for ts, y in reversed(arr):
-        if ts <= cutoff:
-            yes_prev = y
-            break
+    # If it looks like a specific ticker (starts with KX), show just that one
+    if ticker.startswith('KX'):
+        # Single ticker mode
+        yes_now, no_now, last_price, volume, status = await market_snapshot(ticker)
+        
+        if yes_now is None:
+            await interaction.followup.send(f"❌ `{ticker}` is closed or not found (status: {status})")
+            return
+        
+        # Record current price
+        record_price(ticker, yes_now)
+        
+        # Find previous price
+        cutoff = int(time.time()) - minutes * 60
+        arr = histories.get(ticker, [])
+        yes_prev = None
+        for ts, y in reversed(arr):
+            if ts <= cutoff:
+                yes_prev = y
+                break
 
-    # Build response
-    lines = [
-        f"**{ticker}**",
-        f"• YES: {to_cents_str(yes_now)}",
-        f"• NO: {to_cents_str(no_now)}", 
-        f"• Volume: {volume}",
-    ]
+        # Build response for single market
+        lines = [
+            f"**{ticker}**",
+            f"• YES: {to_cents_str(yes_now)}",
+            f"• NO: {to_cents_str(no_now)}", 
+            f"• Volume: {volume}",
+        ]
+        
+        # Price change calculation
+        if yes_prev is not None and yes_now is not None:
+            delta_c = (yes_now - yes_prev) * 100
+            arrow = "↗️" if delta_c > 0 else "↘️" if delta_c < 0 else "➡️"
+            lines.append(f"• Δ {arrow} {delta_c:+.2f}¢ over {minutes}m")
+            lines.append(f"  ({to_cents_str(yes_prev)} → {to_cents_str(yes_now)})")
+        else:
+            lines.append(f"• Δ — (no prior data {minutes}m ago)")
+        
+        await interaction.followup.send("\n".join(lines))
     
-    # Price change calculation
-    if yes_prev is not None and yes_now is not None:
-        delta_c = (yes_now - yes_prev) * 100
-        arrow = "↗️" if delta_c > 0 else "↘️" if delta_c < 0 else "➡️"
-        lines.append(f"• Δ {arrow} {delta_c:+.2f}¢ over {minutes}m")
-        lines.append(f"  ({to_cents_str(yes_prev)} → {to_cents_str(yes_now)})")
     else:
-        lines.append(f"• Δ — (no prior data {minutes}m ago)")
-    
-    await interaction.followup.send("\n".join(lines))
+        # Search term mode - show multiple related markets
+        search_term = input_text.lower()
+        mkts = await fetch_markets_open()
+        
+        hits = []
+        for m in mkts:
+            title = (m.get("title", "") or "").lower()
+            if search_term in title:
+                ticker = m.get("ticker")
+                yes, no_price, last_price, volume, status = await market_snapshot(ticker)
+                # Only include markets that are actually trading
+                if yes is not None:
+                    # Record for history
+                    record_price(ticker, yes)
+                    hits.append((title, ticker, yes, no_price, volume))
+                if len(hits) >= limit:
+                    break
+        
+        if not hits:
+            await interaction.followup.send(f"No **open** markets found for `{search_term}`.")
+            return
+        
+        # Sort by volume (highest first)
+        hits.sort(key=lambda x: x[4], reverse=True)
+        
+        lines = [f"**Markets related to '{search_term}'** (showing {len(hits)} of {limit})"]
+        
+        for title, ticker, yes, no_price, volume in hits:
+            # Find price change for this ticker
+            cutoff = int(time.time()) - minutes * 60
+            arr = histories.get(ticker, [])
+            yes_prev = None
+            for ts, y in reversed(arr):
+                if ts <= cutoff:
+                    yes_prev = y
+                    break
+            
+            change_text = ""
+            if yes_prev is not None and yes is not None:
+                delta_c = (yes - yes_prev) * 100
+                arrow = "↗️" if delta_c > 0 else "↘️" if delta_c < 0 else "➡️"
+                change_text = f" • Δ {arrow} {delta_c:+.2f}¢"
+            
+            lines.append(f"**{title}**")
+            lines.append(f"`{ticker}` • YES: {to_cents_str(yes)} • NO: {to_cents_str(no_price)} • vol={volume}{change_text}\n")
+        
+        for chunk in chunk_lines(lines):
+            await interaction.followup.send(chunk)
 
 # -------------- Alerts --------------
 async def alert_loop():
@@ -479,7 +536,10 @@ async def alert_loop():
                 chan = guild.text_channels[0]
                 for ticker, cfg in list(w.items()):
                     thr = cfg.get("threshold")
-                    yes, _, _, _ = await market_snapshot(ticker)
+                    yes, _, _, _, status = await market_snapshot(ticker)
+                    # Skip if market is closed
+                    if yes is None:
+                        continue
                     # log rolling history for /vol
                     record_price(ticker, yes)
                     if thr is None:
